@@ -11,10 +11,11 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from . import delta
+from .audit import audit_table
 from .sample_data import create_sample_table
 
 DATA_ROOT = Path(os.environ.get("DATA_ROOT", "/data"))
@@ -84,6 +85,80 @@ class TableStatsResponse(BaseModel):
     staging_orphans_cleaned: list[str]
 
 
+class VersionRange(BaseModel):
+    """Inclusive snapshot-version range, e.g. start=3, end=8 means v3..v8."""
+
+    start: int
+    end: int
+
+
+class AuditLogError(BaseModel):
+    """First broken log version: everything from here on is unconfirmed."""
+
+    version: int
+    reason: str
+
+
+class FileAuditEntry(BaseModel):
+    path: str
+    status: str = Field(
+        description=(
+            "ok, or the most severe failure: missing / size_mismatch / "
+            "unreadable / schema_mismatch / row_count_mismatch / "
+            "invalid_path / check_error"
+        )
+    )
+    problems: list[str] = Field(
+        description="Every failed check, human-readable; empty when ok."
+    )
+    expected_size_bytes: int | None
+    actual_size_bytes: int | None
+    expected_rows: int | None
+    rows: int | None
+    active_in_versions: list[VersionRange] = Field(
+        description=(
+            "Contiguous snapshot-version ranges (within the audited range) "
+            "in which this file is part of the snapshot.  For a failed file "
+            "these are exactly the snapshots that can no longer be "
+            "recomputed from it."
+        )
+    )
+
+
+class AuditResponse(BaseModel):
+    table: str
+    requested_upto_version: int = Field(
+        description="Cutoff version the audit ran against (fixed at start)."
+    )
+    latest_committed_version_at_start: int = Field(
+        description="Newest committed log version visible when the audit "
+        "started; commits landing during the audit are not covered."
+    )
+    last_verified_version: int | None = Field(
+        description="Last version whose log replayed cleanly; null if even "
+        "version 0 is broken."
+    )
+    unconfirmed_versions: list[VersionRange] = Field(
+        description="Requested versions after last_verified_version whose "
+        "log is missing or corrupt; nothing is known about them."
+    )
+    log_error: AuditLogError | None
+    passed: bool = Field(
+        description="True only if the whole requested range replayed cleanly "
+        "AND every referenced file passed all checks."
+    )
+    usable_versions: list[VersionRange] = Field(
+        description="Verified snapshots whose referenced files are all "
+        "intact: safe for recomputation jobs."
+    )
+    unusable_versions: list[VersionRange] = Field(
+        description="Verified snapshots referencing at least one failed file."
+    )
+    files_checked: int
+    files_failed: int
+    files: list[FileAuditEntry]
+
+
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
@@ -108,9 +183,14 @@ app = FastAPI(
         "with dataChange=false and preserve every value, duplicate row, "
         "the schema and all old snapshots. Optimistic concurrency control "
         "lets external writers keep committing; the compaction only "
-        "replaces its selected files while all of them are still active."
+        "replaces its selected files while all of them are still active. "
+        "The audit endpoint verifies that every parquet file referenced by "
+        "the snapshots up to a cutoff version still exists on disk, matches "
+        "the size recorded in the Delta log and reads back with the table "
+        "schema, so operators can tell which historical snapshots remain "
+        "usable for recomputation."
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -212,4 +292,63 @@ def stats() -> TableStatsResponse:
             for f in table.schema
         ],
         staging_orphans_cleaned=cleaned,
+    )
+
+
+def _ranges(ranges: list[tuple[int, int]]) -> list[VersionRange]:
+    return [VersionRange(start=start, end=end) for start, end in ranges]
+
+
+@app.get("/table/audit", response_model=AuditResponse, tags=["audit"])
+def audit(
+    upto_version: int | None = Query(
+        default=None,
+        ge=0,
+        description=(
+            "Cutoff version. Every snapshot from 0 up to this version is "
+            "audited; defaults to the newest committed version visible when "
+            "the audit starts."
+        ),
+    ),
+) -> AuditResponse:
+    """Audit the parquet files backing snapshots 0..upto_version.
+
+    For every file referenced by the fixed committed range (including files
+    a compaction removed but old snapshots still reference) the audit checks
+    existence, the size recorded in the Delta log, full read-back and schema
+    conformance, then reports per-file failure reasons with the affected
+    contiguous snapshot-version ranges.  A broken transaction log yields the
+    last verified version and marks the rest unconfirmed.
+    """
+    try:
+        report = audit_table(TABLE_DIR, upto_version=upto_version)
+    except delta.DeltaError as exc:
+        raise _delta_http(exc)
+    return AuditResponse(
+        table=TABLE_NAME,
+        requested_upto_version=report["requested_upto_version"],
+        latest_committed_version_at_start=report[
+            "latest_committed_version_at_start"
+        ],
+        last_verified_version=report["last_verified_version"],
+        unconfirmed_versions=_ranges(report["unconfirmed_versions"]),
+        log_error=report["log_error"],
+        passed=report["passed"],
+        usable_versions=_ranges(report["usable_versions"]),
+        unusable_versions=_ranges(report["unusable_versions"]),
+        files_checked=report["files_checked"],
+        files_failed=report["files_failed"],
+        files=[
+            FileAuditEntry(
+                path=f["path"],
+                status=f["status"],
+                problems=f["problems"],
+                expected_size_bytes=f["expected_size_bytes"],
+                actual_size_bytes=f["actual_size_bytes"],
+                expected_rows=f["expected_rows"],
+                rows=f["rows"],
+                active_in_versions=_ranges(f["active_in_versions"]),
+            )
+            for f in report["files"]
+        ],
     )
